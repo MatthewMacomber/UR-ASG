@@ -1,0 +1,5 @@
+.zig-cache/
+zig-out/
+*.pdb
+*.obj
+UR-ASG (liburasg)_ Standalone Universal Relational Abstract Syntax Graph Specification.md
