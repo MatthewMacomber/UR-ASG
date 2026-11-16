@@ -12,14 +12,15 @@ Unifies compiler AST/SSA graphs, relational EAV tables, and bi-temporal knowledg
 - **4 KB Page-Table CoW Arena**: 256 cells per page, O(pages) copy-on-write snapshots, and per-page epoch tracking.
 - **Cycle-Safe Merkle Hashing**: Incremental `XXH3-64` bottom-up hashing with De Bruijn cycle depth normalization (`#0#`, `#1#`).
 - **Dual Sorted EAV Slabs**: Cache-friendly `SPO` (Subject-Predicate-Object) and `POS` (Predicate-Object-Subject) indexes supporting bi-temporal time slices (`valid_from`, `invalidated_at`).
-- **Pluggable Projectional Lenses**: Surface-syntax-agnostic `UrLensVTable` with reference canonical cyclic S-expressions (`#1= ... #1#`).
+- **Pluggable Projectional Lenses**: Surface-syntax-agnostic `UrLensVTable` with canonical cyclic S-expressions (`#1= ... #1#`, `SexprLens`), human-friendly infix/brace `SweetLens` with `SourceSpan` tracking, and recursive structural `computeTypeDiff` (`.exact`, `.coercible`, `.needs_membrane`).
 - **Zero-Copy Container**: `.urasg` binary format (`URASGv01`) with 64-byte aligned header and payload `XXH3-64` integrity checksum.
 - **Embedded Compiler (`urc`)**:
-  - **Tier 0**: In-arena evaluator with Live Sample Oracle fallback and uncertainty interpolation.
-  - **Tier 1**: Sub-5ms Copy-and-Patch JIT stencils and 64-bit register bytecode VM.
-  - **Tier 2**: Native AOT lowering (Zig, C99, Wasm) and `PINNED_BUILTIN` Merkle binary promoter.
-- **Unified 6-Mode Memory Engine**: Static `MEM_VLANG_AUTOFREE` + `MEM_LOBSTER_RC` hybrid handoff, scoped `MEM_FRAME_ARENA`, Beef generation-guarded traps (`MEM_BEEF_GUARDED`), raw manual (`MEM_RAW_MANUAL`), and CoW GC (`MEM_COW_GC`).
-- **Host Domain Opcode Plugins**: Opcodes `0x80..0xFF` open for domain-specific execution, type-checking, and rewrite passes.
+  - **Tier 0**: In-arena evaluator supporting `int_lit`, `float_lit`, `fixed_q16_16`, `uncertain_f32` arithmetic, positional `argN` bindings, runtime `UseAfterFreeTrap`/`DoubleFreeTrap` enforcement, and Live Sample Oracle fallback.
+  - **Tier 1**: Recursive bytecode lowering (locals, arithmetic, `if_branch` jump backpatching, oracle fallback), PC-driven 64-bit register VM, and pure-Zig `X86Emitter` machine code generation.
+  - **Tier 2**: Recursive freestanding Zig 0.17.0 and C99 AOT source emission mapped from `UrTypeTable`, plus `PINNED_BUILTIN` Merkle binary promoter.
+  - **Composable Graph Passes**: Compile-time constant folding, symbolic differentiation (`diffCell`) and algebraic simplification (`simplifyCell`) attached as `.grad_adjoint` cells, and `.hazel_membrane` wrapping via `UrGraph.spliceHole`.
+- **Unified 6-Mode Memory Engine**: Builtin ownership & alias escape analysis (`MEM_VLANG_AUTOFREE` + `MEM_LOBSTER_RC`, `MEM_FRAME_ARENA`, `MEM_BEEF_GUARDED`, `MEM_RAW_MANUAL`, `MEM_COW_GC`) with live `scope_free` / `rc_adjust` / `gen_guard_check` cell splicing into `unit_def` scopes.
+- **Host Domain Opcode Plugins**: Opcodes `0x80..0xFF` wired across all four `UrCompilerExtension` hooks: `typecheck_domain_cell`, `eval_domain_cell`, `run_custom_rewrite_pass`, and `emit_domain_codegen`.
 
 ---
 
@@ -80,6 +81,41 @@ pub fn main() !void {
 }
 ```
 
+### SweetLens Projectional Syntax & Compiler Pipeline
+
+```zig
+const std = @import("std");
+const urasg = @import("urasg");
+
+pub fn runSweetExample(allocator: std.mem.Allocator) !i64 {
+    var graph = try urasg.UrGraph.create(allocator);
+    defer graph.destroy();
+
+    const sweet_src =
+        \\fn step(arg0) {
+        \\  let doubled = (arg0 * 2);
+        \\  if (doubled > 10) {
+        \\    return (doubled + 5);
+        \\  } else {
+        \\    return (doubled - 1);
+        \\  }
+        \\}
+    ;
+
+    const unit_idx = try urasg.sweet_lens.SweetLens.parseIntoGraph(graph, urasg.NULL_CELL, sweet_src);
+
+    var comp = try urasg.UrCompiler.create(graph, urasg.compiler.core.DEFAULT_FEATURES);
+    defer comp.destroy();
+
+    try urasg.compiler.passes.runAllPasses(comp, unit_idx);
+
+    var t0 = urasg.compiler.tier0.Tier0Evaluator.init(comp);
+    const arg = try graph.allocCell(.{ .kind = .int_lit, .payload = .{ .imm_i64 = 7 } });
+    const out = try t0.evalUnit(unit_idx, &.{arg});
+    return graph.getCell(out).payload.imm_i64; // 19
+}
+```
+
 ### C99 / C++ FFI
 
 ```c
@@ -122,16 +158,17 @@ int main(void) {
     ├── merkle.zig              # Cycle-safe De Bruijn XXH3-64 Merkle hasher
     ├── eav_index.zig           # Dual sorted SPO / POS relational index slabs
     ├── lens_api.zig            # UrLensVTable projectional lens interface
-    ├── sexpr_lens.zig          # Canonical cyclic S-expression codec (#1= ... #1#)
+    ├── sexpr_lens.zig          # Canonical cyclic S-expression codec (#1= ... #1#) & structural TypeDiff
+    ├── sweet_lens.zig          # Human-friendly infix/brace SweetLens with SourceSpan tracking
     ├── binary_codec.zig        # Zero-copy .urasg binary container format (URASGv01)
     └── compiler/               # Embedded Base Native Compiler (urc)
         ├── urc_core.zig        # Compiler state, UrFeatureFlags & time-dilation profiler
-        ├── urc_mem.zig         # 6-mode memory engine (Vlang Autofree, Lobster RC, Beef, Arena)
-        ├── tier0_eval.zig      # In-arena evaluator & Live Sample Oracle fallback
-        ├── tier1_jit.zig       # 64-bit register bytecode VM & Copy-and-Patch stencils
-        ├── tier2_aot.zig       # Native AOT emitter & PINNED_BUILTIN promoter
-        ├── passes.zig          # Composable feature passes
-        └── ext_api.zig         # Host domain opcode extension table (0x80..0xFF)
+        ├── urc_mem.zig         # 6-mode escape analysis & unit instrumentation splicing
+        ├── tier0_eval.zig      # In-arena evaluator, memory trap enforcement & Live Sample Oracle
+        ├── tier1_jit.zig       # Recursive bytecode VM & pure-Zig X86Emitter machine codegen
+        ├── tier2_aot.zig       # Recursive Zig/C99 AOT emitter & PINNED_BUILTIN promoter
+        ├── passes.zig          # Constant folding, symbolic autodiff, membranes & extension hooks
+        └── ext_api.zig         # Host domain opcode extension hooks (0x80..0xFF) & UrEvalEnv
 ```
 
 ---
