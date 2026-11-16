@@ -10,6 +10,7 @@ const UrError = lens_mod.UrError;
 pub const UrEvalEnv = struct {
     allocator: std.mem.Allocator,
     locals: std.AutoHashMapUnmanaged(CellIdx, CellIdx) = .empty,
+    local_cells: std.AutoHashMapUnmanaged(CellIdx, CellIdx) = .empty,
     scratch_cells: std.ArrayListUnmanaged(CellIdx) = .empty,
     generation_guards: std.AutoHashMapUnmanaged(CellIdx, u32) = .empty,
     freed_cells: std.AutoHashMapUnmanaged(CellIdx, void) = .empty,
@@ -18,6 +19,7 @@ pub const UrEvalEnv = struct {
         return .{
             .allocator = allocator,
             .locals = .empty,
+            .local_cells = .empty,
             .scratch_cells = .empty,
             .generation_guards = .empty,
             .freed_cells = .empty,
@@ -26,6 +28,7 @@ pub const UrEvalEnv = struct {
 
     pub fn deinit(self: *UrEvalEnv) void {
         self.locals.deinit(self.allocator);
+        self.local_cells.deinit(self.allocator);
         self.scratch_cells.deinit(self.allocator);
         self.generation_guards.deinit(self.allocator);
         self.freed_cells.deinit(self.allocator);

@@ -6,6 +6,7 @@ pub const merkle = @import("merkle.zig");
 pub const eav_index = @import("eav_index.zig");
 pub const lens_api = @import("lens_api.zig");
 pub const sexpr_lens = @import("sexpr_lens.zig");
+pub const sweet_lens = @import("sweet_lens.zig");
 pub const binary_codec = @import("binary_codec.zig");
 
 pub const compiler = struct {
@@ -434,4 +435,9 @@ test "C ABI functions roundtrip" {
 
     const hash = urasg_merkle_hash(g, c1);
     try std.testing.expect(hash != 0);
+}
+
+comptime {
+    std.testing.refAllDecls(@This());
+    _ = sweet_lens;
 }

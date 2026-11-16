@@ -38,19 +38,60 @@ pub const SexprLens = struct {
     pub fn computeTypeDiff(graph: *const UrGraph, hole_idx: CellIdx, plug_idx: CellIdx) TypeDiff {
         const hole_cell = graph.getCell(hole_idx);
         const plug_cell = graph.getCell(plug_idx);
+        const expected = hole_cell.type_id;
+        const actual = plug_cell.type_id;
 
-        if (hole_cell.type_id == BuiltinType.any_type or hole_cell.type_id == BuiltinType.hole_type or hole_cell.type_id == plug_cell.type_id) {
+        if (expected == BuiltinType.any_type or expected == BuiltinType.hole_type or typesStructurallyEqual(graph, expected, actual, 0)) {
             return .{
                 .status = .exact,
-                .expected_type = hole_cell.type_id,
-                .actual_type = plug_cell.type_id,
+                .expected_type = expected,
+                .actual_type = actual,
             };
         }
+
+        if (isCoercibleTypePair(expected, actual)) {
+            return .{
+                .status = .coercible,
+                .expected_type = expected,
+                .actual_type = actual,
+            };
+        }
+
         return .{
             .status = .needs_membrane,
-            .expected_type = hole_cell.type_id,
-            .actual_type = plug_cell.type_id,
+            .expected_type = expected,
+            .actual_type = actual,
         };
+    }
+
+    fn isCoercibleTypePair(expected: cell_mod.TypeId, actual: cell_mod.TypeId) bool {
+        if ((expected == BuiltinType.float_type and actual == BuiltinType.int_type) or
+            (expected == BuiltinType.int_type and actual == BuiltinType.float_type))
+        {
+            return true;
+        }
+        if (expected == BuiltinType.uncertain_f32_type and
+            (actual == BuiltinType.float_type or actual == BuiltinType.int_type))
+        {
+            return true;
+        }
+        if (expected == BuiltinType.fixed_q16_16_type and
+            (actual == BuiltinType.int_type or actual == BuiltinType.float_type))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    fn typesStructurallyEqual(graph: *const UrGraph, a_id: cell_mod.TypeId, b_id: cell_mod.TypeId, depth: u32) bool {
+        if (a_id == b_id) return true;
+        if (depth >= 16) return false;
+        const a = graph.type_table.getType(a_id) orelse return false;
+        const b = graph.type_table.getType(b_id) orelse return false;
+        if (a.kind == .primitive or b.kind == .primitive) return false;
+        if (a.kind != b.kind or a.name_sym != b.name_sym or a.aux_id != b.aux_id) return false;
+        return typesStructurallyEqual(graph, a.param1, b.param1, depth + 1) and
+            typesStructurallyEqual(graph, a.param2, b.param2, depth + 1);
     }
 };
 
@@ -623,4 +664,24 @@ test "Canonical Cyclic S-Expression print and parse round-trip" {
     try std.testing.expect(std.mem.indexOf(u8, printed, "#1=") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "(unit apply_thruster") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "#1#") != null);
+}
+
+test "SexprLens structural computeTypeDiff and coercible pairs" {
+    const allocator = std.testing.allocator;
+    var graph = try UrGraph.create(allocator);
+    defer graph.destroy();
+
+    const f_hole = try graph.allocCell(.{ .kind = .hazel_hole, .type_id = BuiltinType.float_type });
+    const i_plug = try graph.allocCell(.{ .kind = .int_lit, .type_id = BuiltinType.int_type, .payload = .{ .imm_i64 = 5 } });
+    const b_plug = try graph.allocCell(.{ .kind = .bool_lit, .type_id = BuiltinType.bool_type, .payload = .{ .raw = 1 } });
+
+    try std.testing.expectEqual(lens_mod.TypeDiffStatus.coercible, SexprLens.computeTypeDiff(graph, f_hole, i_plug).status);
+    try std.testing.expectEqual(lens_mod.TypeDiffStatus.needs_membrane, SexprLens.computeTypeDiff(graph, f_hole, b_plug).status);
+
+    // Structural equality over UrTypeTable entries
+    const tid1 = try graph.type_table.internType(.{ .kind = .result, .param1 = BuiltinType.int_type, .param2 = BuiltinType.error_type });
+    const tid2 = try graph.type_table.internType(.{ .kind = .result, .param1 = BuiltinType.int_type, .param2 = BuiltinType.error_type });
+    const c1 = try graph.allocCell(.{ .kind = .hazel_hole, .type_id = tid1 });
+    const c2 = try graph.allocCell(.{ .kind = .int_lit, .type_id = tid2 });
+    try std.testing.expectEqual(lens_mod.TypeDiffStatus.exact, SexprLens.computeTypeDiff(graph, c1, c2).status);
 }

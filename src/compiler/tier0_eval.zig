@@ -40,6 +40,14 @@ pub const Tier0Evaluator = struct {
                 continue;
             }
 
+            if (child_cell.kind == .scope_free or child_cell.kind == .rc_adjust or
+                child_cell.kind == .arena_promote or child_cell.kind == .gen_guard_check or
+                child_cell.kind == .borrow_ref)
+            {
+                _ = try self.evalCell(child_idx, &env, unit_idx, args);
+                continue;
+            }
+
             last_val = try self.evalCell(child_idx, &env, unit_idx, args);
 
             if (child_cell.kind == .return_ok) {
@@ -69,11 +77,23 @@ pub const Tier0Evaluator = struct {
                 return cell_idx;
             },
             .sym_atom => {
+                // Check if local variable's backing let_bind cell was freed
+                if (env.local_cells.get(cell.head_idx)) |let_idx| {
+                    if (env.freed_cells.contains(let_idx)) return error.UseAfterFreeTrap;
+                }
                 // Check local environment
                 if (env.locals.get(cell.head_idx)) |bound_val| {
+                    if (env.freed_cells.contains(bound_val)) return error.UseAfterFreeTrap;
                     return bound_val;
                 }
-                // Check if referencing function argument by index
+                // Support positional "arg0".."arg15" symbols
+                const sym_name = graph.getSym(cell.head_idx);
+                if (std.mem.startsWith(u8, sym_name, "arg")) {
+                    if (std.fmt.parseInt(usize, sym_name[3..], 10)) |arg_idx| {
+                        if (arg_idx < args.len) return args[arg_idx];
+                    } else |_| {}
+                }
+                // Check if referencing function argument by raw index
                 if (cell.head_idx < args.len) {
                     return args[cell.head_idx];
                 }
@@ -84,9 +104,30 @@ pub const Tier0Evaluator = struct {
                 if (children.len > 0) {
                     const val = try self.evalCell(children[0], env, unit_idx, args);
                     env.locals.put(self.compiler.allocator, cell.head_idx, val) catch return error.OutOfMemory;
+                    env.local_cells.put(self.compiler.allocator, cell.head_idx, cell_idx) catch return error.OutOfMemory;
                     return val;
                 }
                 return NULL_CELL;
+            },
+            .scope_free => {
+                const target = cell.head_idx;
+                if (env.freed_cells.contains(target)) return error.DoubleFreeTrap;
+                env.freed_cells.put(self.compiler.allocator, target, {}) catch return error.OutOfMemory;
+                return NULL_CELL;
+            },
+            .gen_guard_check => {
+                const target = cell.head_idx;
+                if (env.freed_cells.contains(target)) return error.UseAfterFreeTrap;
+                const expected_gen: u32 = @truncate(@as(u64, @bitCast(cell.payload.imm_i64)));
+                if (env.generation_guards.get(target)) |live_gen| {
+                    if (live_gen != expected_gen) return error.UseAfterFreeTrap;
+                } else {
+                    env.generation_guards.put(self.compiler.allocator, target, expected_gen) catch return error.OutOfMemory;
+                }
+                return target;
+            },
+            .rc_adjust, .arena_promote, .borrow_ref => {
+                return cell.head_idx;
             },
             .return_ok => {
                 const children = graph.getChildren(cell.payload.slice.start, cell.payload.slice.len);
@@ -132,9 +173,13 @@ pub const Tier0Evaluator = struct {
                 const children = graph.getChildren(cell.payload.slice.start, cell.payload.slice.len);
 
                 if (std.mem.eql(u8, fn_name, "add") or std.mem.eql(u8, fn_name, "+")) {
-                    return self.evalAdd(children, env, unit_idx, args);
+                    return self.evalArith(.add, children, env, unit_idx, args);
+                } else if (std.mem.eql(u8, fn_name, "sub") or std.mem.eql(u8, fn_name, "-")) {
+                    return self.evalArith(.sub, children, env, unit_idx, args);
                 } else if (std.mem.eql(u8, fn_name, "mul") or std.mem.eql(u8, fn_name, "*")) {
-                    return self.evalMul(children, env, unit_idx, args);
+                    return self.evalArith(.mul, children, env, unit_idx, args);
+                } else if (std.mem.eql(u8, fn_name, "div") or std.mem.eql(u8, fn_name, "/")) {
+                    return self.evalArith(.div, children, env, unit_idx, args);
                 } else if (std.mem.eql(u8, fn_name, "gt") or std.mem.eql(u8, fn_name, ">")) {
                     return self.evalGt(children, env, unit_idx, args);
                 } else if (std.mem.eql(u8, fn_name, "str_concat")) {
@@ -150,7 +195,9 @@ pub const Tier0Evaluator = struct {
         }
     }
 
-    fn evalAdd(self: *Tier0Evaluator, children: []const CellIdx, env: *UrEvalEnv, unit_idx: CellIdx, args: []const CellIdx) UrError!CellIdx {
+    const ArithOp = enum { add, sub, mul, div };
+
+    fn evalArith(self: *Tier0Evaluator, op: ArithOp, children: []const CellIdx, env: *UrEvalEnv, unit_idx: CellIdx, args: []const CellIdx) UrError!CellIdx {
         if (children.len < 2) return NULL_CELL;
         const graph = self.compiler.graph;
         const v1 = try self.evalCell(children[0], env, unit_idx, args);
@@ -159,53 +206,58 @@ pub const Tier0Evaluator = struct {
         const c2 = graph.getCell(v2);
 
         if (c1.kind == .int_lit and c2.kind == .int_lit) {
+            const res_i: i64 = switch (op) {
+                .add => c1.payload.imm_i64 + c2.payload.imm_i64,
+                .sub => c1.payload.imm_i64 - c2.payload.imm_i64,
+                .mul => c1.payload.imm_i64 * c2.payload.imm_i64,
+                .div => if (c2.payload.imm_i64 != 0) @divTrunc(c1.payload.imm_i64, c2.payload.imm_i64) else return error.EvaluationError,
+            };
             return graph.allocCell(UrCell{
                 .kind = .int_lit,
                 .type_id = BuiltinType.int_type,
-                .payload = .{ .imm_i64 = c1.payload.imm_i64 + c2.payload.imm_i64 },
+                .payload = .{ .imm_i64 = res_i },
+            }) catch return error.OutOfMemory;
+        } else if (c1.kind == .fixed_q16_16 and c2.kind == .fixed_q16_16) {
+            const q1: i32 = @truncate(c1.payload.imm_i64);
+            const q2: i32 = @truncate(c2.payload.imm_i64);
+            const q_res: i32 = switch (op) {
+                .add => cell_mod.Q16_16.add(q1, q2),
+                .sub => cell_mod.Q16_16.sub(q1, q2),
+                .mul => cell_mod.Q16_16.mul(q1, q2),
+                .div => cell_mod.Q16_16.div(q1, q2),
+            };
+            return graph.allocCell(UrCell{
+                .kind = .fixed_q16_16,
+                .type_id = BuiltinType.fixed_q16_16_type,
+                .payload = .{ .imm_i64 = q_res },
             }) catch return error.OutOfMemory;
         } else if (c1.kind == .float_lit or c2.kind == .float_lit) {
             const f1 = if (c1.kind == .float_lit) c1.payload.imm_f64 else @as(f64, @floatFromInt(c1.payload.imm_i64));
             const f2 = if (c2.kind == .float_lit) c2.payload.imm_f64 else @as(f64, @floatFromInt(c2.payload.imm_i64));
+            const res_f: f64 = switch (op) {
+                .add => f1 + f2,
+                .sub => f1 - f2,
+                .mul => f1 * f2,
+                .div => if (f2 != 0.0) f1 / f2 else return error.EvaluationError,
+            };
             return graph.allocCell(UrCell{
                 .kind = .float_lit,
                 .type_id = BuiltinType.float_type,
-                .payload = .{ .imm_f64 = f1 + f2 },
+                .payload = .{ .imm_f64 = res_f },
             }) catch return error.OutOfMemory;
         } else if (c1.kind == .uncertain_f32 and c2.kind == .uncertain_f32) {
             const unc1 = UncertainF32.fromPayload(c1.payload);
             const unc2 = UncertainF32.fromPayload(c2.payload);
-            const u_res = UncertainF32.add(unc1, unc2);
+            const u_res = switch (op) {
+                .add => UncertainF32.add(unc1, unc2),
+                .sub => UncertainF32.sub(unc1, unc2),
+                .mul => UncertainF32.mul(unc1, unc2),
+                .div => UncertainF32.div(unc1, unc2),
+            };
             return graph.allocCell(UrCell{
                 .kind = .uncertain_f32,
                 .type_id = BuiltinType.uncertain_f32_type,
                 .payload = u_res.toPayload(),
-            }) catch return error.OutOfMemory;
-        }
-        return NULL_CELL;
-    }
-
-    fn evalMul(self: *Tier0Evaluator, children: []const CellIdx, env: *UrEvalEnv, unit_idx: CellIdx, args: []const CellIdx) UrError!CellIdx {
-        if (children.len < 2) return NULL_CELL;
-        const graph = self.compiler.graph;
-        const v1 = try self.evalCell(children[0], env, unit_idx, args);
-        const v2 = try self.evalCell(children[1], env, unit_idx, args);
-        const c1 = graph.getCell(v1);
-        const c2 = graph.getCell(v2);
-
-        if (c1.kind == .int_lit and c2.kind == .int_lit) {
-            return graph.allocCell(UrCell{
-                .kind = .int_lit,
-                .type_id = BuiltinType.int_type,
-                .payload = .{ .imm_i64 = c1.payload.imm_i64 * c2.payload.imm_i64 },
-            }) catch return error.OutOfMemory;
-        } else if (c1.kind == .float_lit or c2.kind == .float_lit) {
-            const f1 = if (c1.kind == .float_lit) c1.payload.imm_f64 else @as(f64, @floatFromInt(c1.payload.imm_i64));
-            const f2 = if (c2.kind == .float_lit) c2.payload.imm_f64 else @as(f64, @floatFromInt(c2.payload.imm_i64));
-            return graph.allocCell(UrCell{
-                .kind = .float_lit,
-                .type_id = BuiltinType.float_type,
-                .payload = .{ .imm_f64 = f1 * f2 },
             }) catch return error.OutOfMemory;
         }
         return NULL_CELL;
@@ -268,7 +320,7 @@ pub const Tier0Evaluator = struct {
         }) catch return error.OutOfMemory;
     }
 
-    fn evalSampleOracle(self: *Tier0Evaluator, unit_idx: CellIdx, args: []const CellIdx) UrError!CellIdx {
+    pub fn evalSampleOracle(self: *Tier0Evaluator, unit_idx: CellIdx, args: []const CellIdx) UrError!CellIdx {
         const graph = self.compiler.graph;
         const unit_cell = graph.getCell(unit_idx);
         const children = graph.getChildren(unit_cell.payload.slice.start, unit_cell.payload.slice.len);
